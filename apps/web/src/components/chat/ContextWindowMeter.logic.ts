@@ -64,3 +64,26 @@ export function formatContextWindowMeterLabel(
     ariaLabel,
   };
 }
+
+/** Token counts at which the composer's context pill changes colour. */
+export const CONTEXT_WINDOW_ELEVATED_TOKENS = 150_000;
+export const CONTEXT_WINDOW_HIGH_TOKENS = 250_000;
+
+export type ContextWindowUsageLevel = "normal" | "elevated" | "high";
+
+/**
+ * Colour band for a token count. These are absolute costs, not a fraction of
+ * the window, so a large context window does not hide an expensive turn.
+ */
+export function resolveContextWindowUsageLevel(usedTokens: number): ContextWindowUsageLevel {
+  if (!Number.isFinite(usedTokens)) {
+    return "normal";
+  }
+  if (usedTokens > CONTEXT_WINDOW_HIGH_TOKENS) {
+    return "high";
+  }
+  if (usedTokens > CONTEXT_WINDOW_ELEVATED_TOKENS) {
+    return "elevated";
+  }
+  return "normal";
+}

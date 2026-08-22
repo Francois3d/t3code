@@ -6,6 +6,7 @@ import {
   formatContextWindowMeterLabel,
   formatContextWindowPercentage,
   resolveContextWindowModelDisplayName,
+  resolveContextWindowUsageLevel,
 } from "./ContextWindowMeter.logic";
 
 describe("resolveContextWindowModelDisplayName", () => {
@@ -115,5 +116,27 @@ describe("formatContextWindowMeterLabel", () => {
         format,
       ).text,
     ).toBe("260k/258k");
+  });
+});
+
+describe("resolveContextWindowUsageLevel", () => {
+  it("stays neutral up to and including 150k tokens", () => {
+    expect(resolveContextWindowUsageLevel(0)).toBe("normal");
+    expect(resolveContextWindowUsageLevel(149_999)).toBe("normal");
+    expect(resolveContextWindowUsageLevel(150_000)).toBe("normal");
+  });
+
+  it("goes elevated past 150k and stays there through 250k", () => {
+    expect(resolveContextWindowUsageLevel(150_001)).toBe("elevated");
+    expect(resolveContextWindowUsageLevel(250_000)).toBe("elevated");
+  });
+
+  it("goes high past 250k", () => {
+    expect(resolveContextWindowUsageLevel(250_001)).toBe("high");
+    expect(resolveContextWindowUsageLevel(900_000)).toBe("high");
+  });
+
+  it("treats a non-finite count as neutral", () => {
+    expect(resolveContextWindowUsageLevel(Number.NaN)).toBe("normal");
   });
 });

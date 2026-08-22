@@ -6,7 +6,20 @@ import {
   formatContextWindowCompactionMessage,
   formatContextWindowMeterLabel,
   formatContextWindowPercentage,
+  resolveContextWindowUsageLevel,
 } from "./ContextWindowMeter.logic";
+
+const USAGE_LEVEL_COLORS = {
+  normal: "color-mix(in oklab, var(--color-muted-foreground) 72%, transparent)",
+  elevated: "var(--color-warning)",
+  high: "var(--color-error)",
+} as const;
+
+const USAGE_LEVEL_TEXT_CLASSES = {
+  normal: null,
+  elevated: "text-warning hover:text-warning data-pressed:text-warning",
+  high: "text-error hover:text-error data-pressed:text-error",
+} as const;
 
 /**
  * Context usage as a number rather than a ring: `14k/258k` where the composer
@@ -24,10 +37,8 @@ export function ContextWindowMeter(props: {
   const normalizedPercentage = Math.max(0, Math.min(100, usage.usedPercentage ?? 0));
   const totalProcessedTokens = usage.totalProcessedTokens ?? null;
   const showTotalProcessed = totalProcessedTokens !== null && totalProcessedTokens > 0;
-  const isOverloaded = normalizedPercentage > 90;
-  const usageColor = isOverloaded
-    ? "var(--color-error)"
-    : "color-mix(in oklab, var(--color-muted-foreground) 72%, transparent)";
+  const usageLevel = resolveContextWindowUsageLevel(usage.usedTokens);
+  const usageColor = USAGE_LEVEL_COLORS[usageLevel];
   const meterLabel = formatContextWindowMeterLabel(usage, {
     compact: props.compact ?? false,
     formatTokens: formatContextWindowTokens,
@@ -45,7 +56,7 @@ export function ContextWindowMeter(props: {
             variant="ghost-muted"
             className={cn(
               "shrink-0 rounded-full px-1.5 font-medium tabular-nums",
-              isOverloaded && "text-error hover:text-error data-pressed:text-error",
+              USAGE_LEVEL_TEXT_CLASSES[usageLevel],
             )}
             aria-label={meterLabel.ariaLabel}
           >
