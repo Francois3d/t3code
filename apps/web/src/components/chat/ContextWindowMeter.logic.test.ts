@@ -1,7 +1,10 @@
 import { ProviderInstanceId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
+import { formatContextWindowTokens } from "~/lib/contextWindow";
 import {
   formatContextWindowCompactionMessage,
+  formatContextWindowMeterLabel,
+  formatContextWindowPercentage,
   resolveContextWindowModelDisplayName,
 } from "./ContextWindowMeter.logic";
 
@@ -54,5 +57,63 @@ describe("formatContextWindowCompactionMessage", () => {
     expect(formatContextWindowCompactionMessage(null)).toBe(
       "Context compacts automatically when needed.",
     );
+  });
+});
+
+describe("formatContextWindowPercentage", () => {
+  it("keeps one decimal below ten percent and rounds above it", () => {
+    expect(formatContextWindowPercentage(3.14)).toBe("3.1%");
+    expect(formatContextWindowPercentage(4)).toBe("4%");
+    expect(formatContextWindowPercentage(87.4)).toBe("87%");
+  });
+
+  it("has nothing to show without a denominator", () => {
+    expect(formatContextWindowPercentage(null)).toBe(null);
+  });
+});
+
+describe("formatContextWindowMeterLabel", () => {
+  const format = { compact: false, formatTokens: formatContextWindowTokens };
+
+  it("shows used over max when the composer has room", () => {
+    expect(
+      formatContextWindowMeterLabel(
+        { usedTokens: 14_200, maxTokens: 258_000, usedPercentage: 5.5 },
+        format,
+      ),
+    ).toEqual({
+      text: "14k/258k",
+      ariaLabel: "Context window: 5.5% used, 14k of 258k tokens",
+    });
+  });
+
+  it("drops to the percentage alone in the compact footer", () => {
+    expect(
+      formatContextWindowMeterLabel(
+        { usedTokens: 224_000, maxTokens: 258_000, usedPercentage: 86.8 },
+        { ...format, compact: true },
+      ).text,
+    ).toBe("87%");
+  });
+
+  it("shows the used tokens alone when the provider reports no context window", () => {
+    expect(
+      formatContextWindowMeterLabel(
+        { usedTokens: 81_659, maxTokens: null, usedPercentage: null },
+        format,
+      ),
+    ).toEqual({
+      text: "82k",
+      ariaLabel: "Context window: 82k tokens used",
+    });
+  });
+
+  it("prints the provider's unclamped token count even past the window", () => {
+    expect(
+      formatContextWindowMeterLabel(
+        { usedTokens: 260_000, maxTokens: 258_000, usedPercentage: 100 },
+        format,
+      ).text,
+    ).toBe("260k/258k");
   });
 });

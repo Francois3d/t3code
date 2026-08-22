@@ -1,34 +1,37 @@
 import { Button } from "../ui/button";
 import { type ContextWindowSnapshot, formatContextWindowTokens } from "~/lib/contextWindow";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
-import { formatContextWindowCompactionMessage } from "./ContextWindowMeter.logic";
+import { cn } from "~/lib/utils";
+import {
+  formatContextWindowCompactionMessage,
+  formatContextWindowMeterLabel,
+  formatContextWindowPercentage,
+} from "./ContextWindowMeter.logic";
 
-function formatPercentage(value: number | null): string | null {
-  if (value === null || !Number.isFinite(value)) {
-    return null;
-  }
-  if (value < 10) {
-    return `${value.toFixed(1).replace(/\.0$/, "")}%`;
-  }
-  return `${Math.round(value)}%`;
-}
-
+/**
+ * Context usage as a number rather than a ring: `14k/258k` where the composer
+ * has room, the percentage alone once the footer goes compact. `compact` comes
+ * from the composer's footer breakpoint, because the right action group is
+ * `flex-nowrap shrink-0` and any width this takes comes out of the model picker.
+ */
 export function ContextWindowMeter(props: {
   usage: ContextWindowSnapshot;
   modelDisplayName?: string | null;
+  compact?: boolean;
 }) {
   const { usage, modelDisplayName } = props;
-  const usedPercentage = formatPercentage(usage.usedPercentage);
+  const usedPercentage = formatContextWindowPercentage(usage.usedPercentage);
   const normalizedPercentage = Math.max(0, Math.min(100, usage.usedPercentage ?? 0));
-  const radius = 9.75;
-  const circumference = 2 * Math.PI * radius;
-  const dashOffset = circumference * (1 - normalizedPercentage / 100);
   const totalProcessedTokens = usage.totalProcessedTokens ?? null;
   const showTotalProcessed = totalProcessedTokens !== null && totalProcessedTokens > 0;
   const isOverloaded = normalizedPercentage > 90;
   const usageColor = isOverloaded
     ? "var(--color-error)"
     : "color-mix(in oklab, var(--color-muted-foreground) 72%, transparent)";
+  const meterLabel = formatContextWindowMeterLabel(usage, {
+    compact: props.compact ?? false,
+    formatTokens: formatContextWindowTokens,
+  });
 
   return (
     <Popover>
@@ -38,43 +41,15 @@ export function ContextWindowMeter(props: {
         closeDelay={0}
         render={
           <Button
-            size="icon-sm"
+            size="micro"
             variant="ghost-muted"
-            className="size-7 rounded-full hover:text-muted-foreground data-pressed:text-muted-foreground"
-            aria-label={
-              usage.maxTokens !== null && usedPercentage
-                ? `Context window ${usedPercentage} used`
-                : `Context window ${formatContextWindowTokens(usage.usedTokens)} tokens used`
-            }
+            className={cn(
+              "shrink-0 rounded-full px-1.5 font-medium tabular-nums",
+              isOverloaded && "text-error hover:text-error data-pressed:text-error",
+            )}
+            aria-label={meterLabel.ariaLabel}
           >
-            <span className="relative flex size-5 items-center justify-center">
-              <svg
-                viewBox="0 0 24 24"
-                className="-rotate-90 absolute inset-0 size-full transform-gpu mx-0!"
-                aria-hidden="true"
-              >
-                <circle
-                  cx="12"
-                  cy="12"
-                  r={radius}
-                  fill="none"
-                  stroke="color-mix(in oklab, var(--color-muted-foreground) 24%, transparent)"
-                  strokeWidth="3"
-                />
-                <circle
-                  cx="12"
-                  cy="12"
-                  r={radius}
-                  fill="none"
-                  stroke={usageColor}
-                  strokeWidth="3"
-                  strokeLinecap="round"
-                  strokeDasharray={circumference}
-                  strokeDashoffset={dashOffset}
-                  className="transition-[stroke-dashoffset,stroke] duration-500 ease-out motion-reduce:transition-none"
-                />
-              </svg>
-            </span>
+            {meterLabel.text}
           </Button>
         }
       />

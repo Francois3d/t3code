@@ -23,3 +23,44 @@ export function formatContextWindowCompactionMessage(
     ? `Context for ${modelDisplayName} compacts automatically when needed.`
     : "Context compacts automatically when needed.";
 }
+
+/** Percentage as shown in the meter: one decimal below 10%, whole numbers above. */
+export function formatContextWindowPercentage(value: number | null): string | null {
+  if (value === null || !Number.isFinite(value)) {
+    return null;
+  }
+  if (value < 10) {
+    return `${value.toFixed(1).replace(/\.0$/, "")}%`;
+  }
+  return `${Math.round(value)}%`;
+}
+
+/**
+ * Text the composer's context pill shows, plus the label screen readers get.
+ * The pill reads `used/max` when there is room and a denominator; it falls back
+ * to the percentage alone in the compact footer, and to the used tokens alone
+ * when the provider has not reported a context window yet.
+ */
+export function formatContextWindowMeterLabel(
+  usage: {
+    usedTokens: number;
+    maxTokens?: number | null;
+    usedPercentage: number | null;
+  },
+  options: { compact: boolean; formatTokens: (value: number | null) => string },
+): { text: string; ariaLabel: string } {
+  const { formatTokens } = options;
+  const percentage = formatContextWindowPercentage(usage.usedPercentage);
+  const used = formatTokens(usage.usedTokens);
+
+  const maxTokens = usage.maxTokens ?? null;
+  if (maxTokens === null || percentage === null) {
+    return { text: used, ariaLabel: `Context window: ${used} tokens used` };
+  }
+
+  const ariaLabel = `Context window: ${percentage} used, ${used} of ${formatTokens(maxTokens)} tokens`;
+  return {
+    text: options.compact ? percentage : `${used}/${formatTokens(maxTokens)}`,
+    ariaLabel,
+  };
+}
