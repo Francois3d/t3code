@@ -61,11 +61,15 @@ export function createProjectEnvironmentAtoms<R, E>(
       tag: WS_METHODS.projectsSearchEntries,
       staleTimeMs: 15_000,
     }),
+    // The server says when its own entry index moved, so files an agent creates
+    // or deletes during a turn land in the tree without waiting out the stale
+    // window. Changes made outside the app still need a remount.
     listEntries: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:projects:list-entries",
       tag: WS_METHODS.projectsListEntries,
       staleTimeMs: 30_000,
       idleTtlMs: 5 * 60_000,
+      invalidate: (input) => subscribe(WS_METHODS.subscribeProjectEntryChanges, input),
     }),
     // The server watches the open file and says when it moved, so an agent (or
     // anything else) editing on disk lands in the viewer without polling and

@@ -5150,6 +5150,49 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
   );
 
+  it.effect(
+    "routes websocket rpc subscribeProjectEntryChanges for writes made through the app",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const workspaceDir = yield* fs.makeTempDirectoryScoped({
+          prefix: "t3-ws-project-entries-watch-",
+        });
+        yield* fs.writeFileString(path.join(workspaceDir, "README.md"), "# workspace\n");
+
+        yield* buildAppUnderTest();
+
+        const wsUrl = yield* getWsServerUrl("/ws");
+        const result = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            Effect.gen(function* () {
+              const watcher = yield* client[WS_METHODS.subscribeProjectEntryChanges]({
+                cwd: workspaceDir,
+              }).pipe(Stream.runHead, Effect.forkChild());
+              // A completed round trip on the same socket proves the server has
+              // read the subscription frame ahead of the write, so the signal
+              // that write raises cannot arrive before the watcher is
+              // listening. It also primes the index, so the write refreshes a
+              // live listing rather than building one from cold.
+              yield* client[WS_METHODS.projectsListEntries]({ cwd: workspaceDir });
+              yield* client[WS_METHODS.projectsWriteFile]({
+                cwd: workspaceDir,
+                relativePath: "src/created.ts",
+                contents: "export const created = true;\n",
+              });
+              const event = yield* Fiber.join(watcher).pipe(Effect.timeout(Duration.seconds(10)));
+              const listing = yield* client[WS_METHODS.projectsListEntries]({ cwd: workspaceDir });
+              return { event, listing };
+            }),
+          ),
+        );
+
+        assert.deepEqual(result.event, Option.some({}));
+        assert.isTrue(result.listing.entries.some((entry) => entry.path === "src/created.ts"));
+      }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
+  );
+
   it.effect("routes websocket rpc subscribeProjectFileChanges for edits made outside the app", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

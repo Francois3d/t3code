@@ -6,12 +6,16 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as PubSub from "effect/PubSub";
 import * as RcMap from "effect/RcMap";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 
 import type {
   FilesystemBrowseInput,
   FilesystemBrowseResult,
+  ProjectEntriesChangedEvent,
   ProjectListEntriesInput,
   ProjectListEntriesResult,
   ProjectSearchContentsInput,
@@ -100,6 +104,17 @@ export class WorkspaceEntries extends Context.Service<
       input: ProjectSearchContentsInput,
     ) => Effect.Effect<ProjectSearchContentsResult, WorkspaceEntriesError>;
     readonly refresh: (cwd: string) => Effect.Effect<void>;
+    /**
+     * Emits once per `refresh` of the same workspace root. It is a signal, not
+     * a payload: subscribers re-read through `list`.
+     *
+     * Acquiring the subscription is the effect and consuming it is the stream,
+     * so a caller that has awaited this call is already listening and cannot
+     * miss a refresh it goes on to trigger itself.
+     */
+    readonly watchEntries: (
+      input: ProjectListEntriesInput,
+    ) => Effect.Effect<Stream.Stream<ProjectEntriesChangedEvent>, never, Scope.Scope>;
   }
 >()("t3/workspace/WorkspaceEntries") {}
 
@@ -149,11 +164,25 @@ export const make = Effect.gen(function* () {
     return yield* workspacePaths.normalizeWorkspaceRoot(cwd);
   });
 
+  /**
+   * The key both sides of `entryChanges` agree on. It falls back to the raw
+   * `cwd` so a root that cannot be normalised still pairs its publishes with
+   * its subscribers instead of silently going quiet.
+   */
+  const workspaceRootKey = (cwd: string) =>
+    normalizeWorkspaceRoot(cwd).pipe(Effect.orElseSucceed(() => cwd));
+
+  /**
+   * Unbounded rather than sliding: several workspace roots share this channel,
+   * and a sliding buffer would let a busy root evict a quiet one's signal from
+   * a subscriber that only cares about the quiet one. Every subscriber is a
+   * live stream that drains as it goes, and its scope closes with its socket.
+   */
+  const entryChanges = yield* PubSub.unbounded<string>();
+
   const refresh: WorkspaceEntries["Service"]["refresh"] = Effect.fn("WorkspaceEntries.refresh")(
     function* (cwd) {
-      const normalizedCwd = yield* normalizeWorkspaceRoot(cwd).pipe(
-        Effect.orElseSucceed(() => cwd),
-      );
+      const normalizedCwd = yield* workspaceRootKey(cwd);
       for (const variant of WorkspaceSearchIndex.WORKSPACE_SEARCH_INDEX_VARIANTS) {
         const indexKey = WorkspaceSearchIndex.workspaceSearchIndexKey(normalizedCwd, variant);
         if (!(yield* RcMap.has(workspaceSearchIndexes.rcMap, indexKey))) {
@@ -185,8 +214,24 @@ export const make = Effect.gen(function* () {
           }),
         );
       }
+      // After the indexes, never before: a subscriber that re-lists on this
+      // signal must see the refreshed listing, not the one it replaced.
+      yield* PubSub.publish(entryChanges, normalizedCwd);
     },
   );
+
+  const watchEntries: WorkspaceEntries["Service"]["watchEntries"] = Effect.fn(
+    "WorkspaceEntries.watchEntries",
+  )(function* (input) {
+    // Subscribe before resolving the key, so a refresh landing while the root
+    // is being normalised is buffered rather than dropped.
+    const subscription = yield* PubSub.subscribe(entryChanges);
+    const normalizedCwd = yield* workspaceRootKey(input.cwd);
+    return Stream.fromSubscription(subscription).pipe(
+      Stream.filter((changedCwd) => changedCwd === normalizedCwd),
+      Stream.map(() => ({})),
+    );
+  });
 
   const browse: WorkspaceEntries["Service"]["browse"] = Effect.fn("WorkspaceEntries.browse")(
     function* (input) {
@@ -288,7 +333,7 @@ export const make = Effect.gen(function* () {
     },
   );
 
-  return WorkspaceEntries.of({ browse, list, refresh, search, searchContents });
+  return WorkspaceEntries.of({ browse, list, refresh, search, searchContents, watchEntries });
 });
 
 export const layer = Layer.effect(WorkspaceEntries, make).pipe(

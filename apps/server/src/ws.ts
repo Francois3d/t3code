@@ -1996,6 +1996,12 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "workspace" },
           ),
+        [WS_METHODS.subscribeProjectEntryChanges]: (input) =>
+          observeRpcStreamEffect(
+            WS_METHODS.subscribeProjectEntryChanges,
+            workspaceEntries.watchEntries(input),
+            { "rpc.aggregate": "workspace" },
+          ),
         [WS_METHODS.projectsReadFile]: (input) =>
           observeRpcEffect(
             WS_METHODS.projectsReadFile,

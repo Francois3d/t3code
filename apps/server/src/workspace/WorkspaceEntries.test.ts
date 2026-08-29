@@ -7,7 +7,9 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
+import * as Stream from "effect/Stream";
 import { vi } from "vite-plus/test";
 
 import * as ServerConfig from "../config.ts";
@@ -120,6 +122,34 @@ it.layer(TestLayer, { excludeTestServices: true })("WorkspaceEntries", (it) => {
         expect(result.entries.some((entry) => entry.path.startsWith("node_modules"))).toBe(false);
         expect(result.truncated).toBe(false);
       }),
+    );
+  });
+
+  describe("watchEntries", () => {
+    it.effect("signals only the workspace root whose index refreshed", () =>
+      Effect.gen(function* () {
+        const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
+        const cwd = yield* makeTempDir({ prefix: "t3code-workspace-watch-entries-" });
+        const otherCwd = yield* makeTempDir({ prefix: "t3code-workspace-watch-entries-other-" });
+
+        // Awaiting the acquisitions attaches both subscriptions, so neither
+        // refresh below can land before its watcher is listening.
+        const watched = yield* workspaceEntries.watchEntries({ cwd });
+        const other = yield* workspaceEntries.watchEntries({ cwd: otherCwd });
+
+        yield* workspaceEntries.refresh(otherCwd);
+        expect(
+          yield* Effect.raceFirst(
+            // `watched` is raced first deliberately: were it to ignore the key
+            // it would have a signal waiting and would win outright.
+            Stream.runHead(watched).pipe(Effect.as("watched")),
+            Stream.runHead(other).pipe(Effect.as("other")),
+          ),
+        ).toBe("other");
+
+        yield* workspaceEntries.refresh(cwd);
+        expect(yield* Stream.runHead(watched)).toEqual(Option.some({}));
+      }).pipe(Effect.scoped),
     );
   });
 

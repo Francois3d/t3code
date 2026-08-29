@@ -81,6 +81,15 @@ export const ProjectListEntriesResult = Schema.Struct({
 });
 export type ProjectListEntriesResult = typeof ProjectListEntriesResult.Type;
 
+/**
+ * Emitted by `subscribeProjectEntryChanges` whenever the server's entry index
+ * for a workspace is refreshed. Like `ProjectFileChangedEvent` it carries no
+ * payload: clients re-read the listing through `projects.listEntries` so
+ * limits, ordering and error mapping keep living in one place.
+ */
+export const ProjectEntriesChangedEvent = Schema.Struct({});
+export type ProjectEntriesChangedEvent = typeof ProjectEntriesChangedEvent.Type;
+
 export const ProjectEntriesFailure = Schema.Literals([
   "workspace_root_not_found",
   "workspace_root_create_failed",

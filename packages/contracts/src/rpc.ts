@@ -112,6 +112,7 @@ import {
   RelayClientStatusSchema,
 } from "./relayClient.ts";
 import {
+  ProjectEntriesChangedEvent,
   ProjectFileChangedEvent,
   ProjectListEntriesError,
   ProjectListEntriesInput,
@@ -324,6 +325,7 @@ export const WS_METHODS = {
   // Streaming subscriptions
   subscribeVcsStatus: "subscribeVcsStatus",
   subscribeProjectFileChanges: "subscribeProjectFileChanges",
+  subscribeProjectEntryChanges: "subscribeProjectEntryChanges",
   subscribeTerminalEvents: "subscribeTerminalEvents",
   subscribeTerminalMetadata: "subscribeTerminalMetadata",
   subscribePreviewEvents: "subscribePreviewEvents",
@@ -654,6 +656,19 @@ export const WsProjectsListEntriesRpc = Rpc.make(WS_METHODS.projectsListEntries,
   payload: ProjectListEntriesInput,
   success: ProjectListEntriesResult,
   error: Schema.Union([ProjectListEntriesError, EnvironmentAuthorizationError]),
+});
+
+/**
+ * Says when one workspace's entry list moved, so an open file tree re-lists
+ * instead of waiting out its staleness window. The signal originates from the
+ * server's own index refresh, so it covers changes made through the app -
+ * including an agent's - and nothing else.
+ */
+export const WsSubscribeProjectEntryChangesRpc = Rpc.make(WS_METHODS.subscribeProjectEntryChanges, {
+  payload: ProjectListEntriesInput,
+  success: ProjectEntriesChangedEvent,
+  error: EnvironmentAuthorizationError,
+  stream: true,
 });
 
 export const WsProjectsReadFileRpc = Rpc.make(WS_METHODS.projectsReadFile, {
@@ -1075,6 +1090,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSourceControlCloneRepositoryRpc,
   WsSourceControlPublishRepositoryRpc,
   WsProjectsListEntriesRpc,
+  WsSubscribeProjectEntryChangesRpc,
   WsProjectsReadFileRpc,
   WsSubscribeProjectFileChangesRpc,
   WsProjectsSearchContentsRpc,

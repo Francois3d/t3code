@@ -77,6 +77,8 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.sourceControlCloneRepository]: AuthOrchestrationOperateScope,
   [WS_METHODS.sourceControlPublishRepository]: AuthOrchestrationOperateScope,
   [WS_METHODS.projectsListEntries]: AuthOrchestrationReadScope,
+  // Watching a listing you are already allowed to read is still reading.
+  [WS_METHODS.subscribeProjectEntryChanges]: AuthOrchestrationReadScope,
   [WS_METHODS.projectsReadFile]: AuthOrchestrationReadScope,
   // Watching a file you are already allowed to read is still reading.
   [WS_METHODS.subscribeProjectFileChanges]: AuthOrchestrationReadScope,
