@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import {
   FileFinder,
   type FileItem,
@@ -6,9 +7,16 @@ import {
   type GrepResult,
 } from "@ff-labs/fff-node";
 import { afterEach, expect, it } from "@effect/vitest";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import * as Cause from "effect/Cause";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Logger from "effect/Logger";
+import * as Scope from "effect/Scope";
+import * as TestClock from "effect/testing/TestClock";
 import { vi } from "vite-plus/test";
 
 import * as WorkspaceSearchIndex from "./WorkspaceSearchIndex.ts";
@@ -16,6 +24,35 @@ import * as WorkspaceSearchIndex from "./WorkspaceSearchIndex.ts";
 afterEach(() => {
   vi.restoreAllMocks();
 });
+
+function scanProgress(isWatcherReady: boolean) {
+  return {
+    ok: true as const,
+    value: {
+      scannedFilesCount: 1,
+      isScanning: false,
+      isWatcherReady,
+      isWarmupComplete: true,
+    },
+  };
+}
+
+/** A scan-progress mock reporting a background filesystem watcher already live. */
+function watcherReadyProgress() {
+  return vi.fn(() => scanProgress(true));
+}
+
+function mockFinder(getScanProgress: () => ReturnType<typeof scanProgress>) {
+  const scanFiles = vi.fn(() => ({ ok: true as const, value: undefined }));
+  const finder = {
+    destroy: vi.fn(),
+    waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
+    getScanProgress,
+    scanFiles,
+  } as unknown as FileFinder;
+  vi.spyOn(FileFinder, "create").mockReturnValueOnce({ ok: true, value: finder });
+  return { finder, scanFiles };
+}
 
 function fileItem(relativePath: string): FileItem {
   return {
@@ -49,6 +86,7 @@ it.effect("filters image searches before applying the result limit", () =>
       const finder = {
         destroy: vi.fn(),
         waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
+        getScanProgress: watcherReadyProgress(),
         fileSearch,
       } as unknown as FileFinder;
       vi.spyOn(FileFinder, "create").mockReturnValueOnce({ ok: true, value: finder });
@@ -148,6 +186,7 @@ it.effect("preserves FileFinder destroy failures as structured defects", () =>
         throw cause;
       }),
       waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
+      getScanProgress: watcherReadyProgress(),
     } as unknown as FileFinder;
     vi.spyOn(FileFinder, "create").mockReturnValueOnce({ ok: true, value: finder });
 
@@ -178,6 +217,7 @@ it.effect("preserves search and refresh failures with operation context", () =>
       const finder = {
         destroy: vi.fn(),
         waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
+        getScanProgress: watcherReadyProgress(),
         mixedSearch: vi.fn(() => {
           throw searchCause;
         }),
@@ -240,6 +280,7 @@ it.effect("keeps returned search diagnostics out of the cause chain", () =>
       const finder = {
         destroy: vi.fn(),
         waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
+        getScanProgress: watcherReadyProgress(),
         mixedSearch: vi.fn(() => ({ ok: false, error: "native query rejected" })),
         scanFiles: vi.fn(() => ({ ok: false, error: "native refresh rejected" })),
       } as unknown as FileFinder;
@@ -317,6 +358,7 @@ it.effect("continues whole-word searches after a filtered grep page", () =>
       const finder = {
         destroy: vi.fn(),
         waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
+        getScanProgress: watcherReadyProgress(),
         grep,
       } as unknown as FileFinder;
       vi.spyOn(FileFinder, "create").mockReturnValueOnce({ ok: true, value: finder });
@@ -345,4 +387,124 @@ it.effect("continues whole-word searches after a filtered grep page", () =>
       expect(grep.mock.calls[1]?.[1]?.cursor).toBe(nextCursor);
     }),
   ),
+);
+
+it.effect("rescans once the filesystem watcher goes live, without blocking creation", () =>
+  Effect.gen(function* () {
+    let polls = 0;
+    const { scanFiles } = mockFinder(vi.fn(() => scanProgress(++polls >= 3)));
+
+    const scope = yield* Scope.make();
+    // Creation must not wait on the watcher: the file tree would sit empty
+    // behind it on every workspace open.
+    yield* Effect.provideService(
+      WorkspaceSearchIndex.make("/workspace/project"),
+      Scope.Scope,
+      scope,
+    );
+    expect(scanFiles).not.toHaveBeenCalled();
+
+    yield* TestClock.adjust(Duration.seconds(1));
+    expect(scanFiles).toHaveBeenCalledTimes(1);
+
+    yield* Scope.close(scope, Exit.void);
+  }),
+);
+
+it.effect("does not rescan when the watcher was already live at creation", () =>
+  Effect.gen(function* () {
+    const { scanFiles } = mockFinder(watcherReadyProgress());
+
+    const scope = yield* Scope.make();
+    yield* Effect.provideService(
+      WorkspaceSearchIndex.make("/workspace/project"),
+      Scope.Scope,
+      scope,
+    );
+
+    yield* TestClock.adjust(Duration.seconds(15));
+    expect(scanFiles).not.toHaveBeenCalled();
+
+    yield* Scope.close(scope, Exit.void);
+  }),
+);
+
+it.effect("serves a non-live index when the watcher never becomes ready", () => {
+  const warnings: string[] = [];
+  const logger = Logger.make(({ logLevel, message }) => {
+    if (logLevel === "Warn") warnings.push(String(message));
+  });
+
+  return Effect.gen(function* () {
+    const { scanFiles } = mockFinder(vi.fn(() => scanProgress(false)));
+
+    const scope = yield* Scope.make();
+    yield* Effect.provideService(
+      WorkspaceSearchIndex.make("/workspace/project"),
+      Scope.Scope,
+      scope,
+    );
+
+    yield* TestClock.adjust(Duration.seconds(15));
+    expect(scanFiles).not.toHaveBeenCalled();
+    expect(warnings).toEqual([
+      expect.stringContaining("serving without a live file watcher") as unknown as string,
+    ]);
+
+    yield* Scope.close(scope, Exit.void);
+  }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+});
+
+it.effect("stops waiting for a watcher whose readiness cannot be read", () =>
+  Effect.gen(function* () {
+    const getScanProgress = vi.fn<() => ReturnType<typeof scanProgress>>(() => {
+      throw new Error("native scan progress unavailable");
+    });
+    const { scanFiles } = mockFinder(getScanProgress);
+
+    const scope = yield* Scope.make();
+    yield* Effect.provideService(
+      WorkspaceSearchIndex.make("/workspace/project"),
+      Scope.Scope,
+      scope,
+    );
+
+    yield* TestClock.adjust(Duration.seconds(15));
+    expect(getScanProgress).toHaveBeenCalledTimes(1);
+    expect(scanFiles).not.toHaveBeenCalled();
+
+    yield* Scope.close(scope, Exit.void);
+  }),
+);
+
+// it.live: this drives the real native finder and its background watcher, so
+// it needs real elapsed time rather than TestClock's virtual clock.
+it.live("indexes a file created externally right after construction, without a refresh", () =>
+  Effect.gen(function* () {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-workspace-index-"));
+    // 20k files, so the scan finishes well before the watcher goes live. A
+    // smaller tree does not separate the two and the test stops guarding the
+    // window the index used to serve blind.
+    for (let directory = 0; directory < 200; directory++) {
+      const directoryPath = NodePath.join(root, `dir-${directory}`);
+      NodeFS.mkdirSync(directoryPath);
+      for (let file = 0; file < 100; file++) {
+        NodeFS.writeFileSync(NodePath.join(directoryPath, `file-${file}.ts`), "export {};\n");
+      }
+    }
+
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const searchIndex = yield* WorkspaceSearchIndex.make(root);
+        NodeFS.writeFileSync(NodePath.join(root, "created-externally.txt"), "hi");
+
+        // No refresh() here on purpose: only a live watcher can surface this.
+        yield* Effect.sleep("1 second");
+        const { entries } = yield* searchIndex.list();
+        expect(entries.map((entry) => entry.path)).toContain("created-externally.txt");
+      }),
+    ).pipe(
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(root, { recursive: true, force: true }))),
+    );
+  }),
 );

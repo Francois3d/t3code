@@ -10,9 +10,12 @@ import {
   type SearchResult,
 } from "@ff-labs/fff-node";
 import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as LayerMap from "effect/LayerMap";
+import * as Option from "effect/Option";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 
 import type {
@@ -30,6 +33,8 @@ const WORKSPACE_INDEX_PAGE_SIZE = WORKSPACE_INDEX_MAX_ENTRIES + 2;
 const WORKSPACE_INDEX_SCAN_TIMEOUT = "15 seconds";
 const WORKSPACE_INDEX_SCAN_TIMEOUT_MS = 15_000;
 const WORKSPACE_INDEX_IDLE_TTL = "15 minutes";
+const WORKSPACE_INDEX_WATCHER_POLL_INTERVAL = Duration.millis(50);
+const WORKSPACE_INDEX_WATCHER_TIMEOUT = Duration.millis(WORKSPACE_INDEX_SCAN_TIMEOUT_MS);
 const CONTENT_SEARCH_TIME_BUDGET_MS = 250;
 const CONTENT_SEARCH_MAX_MATCHES_PER_FILE = 100;
 
@@ -352,6 +357,79 @@ const waitForIndexReady = Effect.fn("WorkspaceSearchIndex.waitForIndexReady")(fu
   }
 });
 
+/**
+ * `waitForIndexReady` covers only the scan and warmup phases; the background
+ * filesystem watcher goes live up to a second later, and every external change
+ * in that window is lost permanently because nothing rescans once the watcher
+ * does start.
+ *
+ * Blocking creation on the watcher would put that second in front of the file
+ * tree on every workspace open, so the index serves immediately and this
+ * closes the window from behind instead: wait for the watcher off the critical
+ * path, then rescan once to pick up whatever the window swallowed. A watcher
+ * that never arrives degrades to a non-live index with a warning rather than
+ * taking the index down - search still answers correctly, it just stops
+ * tracking edits until the next explicit refresh.
+ *
+ * Polling is what the native index itself offers - `waitForIndexReady` polls
+ * the same snapshot - so there is no watcher-ready event to wait on instead.
+ */
+const rescanWhenWatcherReady = Effect.fn("WorkspaceSearchIndex.rescanWhenWatcherReady")(function* (
+  cwd: string,
+  finder: FileFinder,
+): Effect.fn.Return<void> {
+  const warn = (message: string) =>
+    Effect.logWarning(message).pipe(
+      Effect.annotateLogs({ cwd, watcherTimeout: WORKSPACE_INDEX_SCAN_TIMEOUT }),
+    );
+
+  const pollWatcher = Effect.try(() => finder.getScanProgress()).pipe(
+    Effect.match({
+      onFailure: () => "unreadable" as const,
+      onSuccess: (progress) => {
+        if (!progress.ok) return "unreadable" as const;
+        return progress.value.isWatcherReady ? ("ready" as const) : ("starting" as const);
+      },
+    }),
+  );
+
+  // The watcher was already live when the scan finished, so nothing can have
+  // been missed and a rescan would be pure cost.
+  const initialStatus = yield* pollWatcher;
+  if (initialStatus === "ready") return;
+  if (initialStatus === "unreadable") {
+    return yield* warn(
+      "Workspace search index is serving without a confirmed file watcher: its readiness could not be read.",
+    );
+  }
+
+  const outcome = yield* pollWatcher.pipe(
+    Effect.repeat({
+      // A watcher whose readiness cannot be read is not going to start
+      // reporting it later, so stop polling instead of burning the budget.
+      until: (status) => status !== "starting",
+      schedule: Schedule.spaced(WORKSPACE_INDEX_WATCHER_POLL_INTERVAL),
+    }),
+    Effect.timeoutOption(WORKSPACE_INDEX_WATCHER_TIMEOUT),
+    Effect.map(Option.getOrElse(() => "timedOut" as const)),
+  );
+  if (outcome !== "ready") {
+    return yield* warn(
+      "Workspace search index is serving without a live file watcher; external changes will not appear until the next refresh.",
+    );
+  }
+
+  const rescanned = yield* Effect.try(() => finder.scanFiles()).pipe(
+    Effect.map((result) => result.ok),
+    Effect.orElseSucceed(() => false),
+  );
+  if (!rescanned) {
+    yield* warn(
+      "Workspace search index could not rescan after its file watcher went live; changes made during startup may be missing until the next refresh.",
+    );
+  }
+});
+
 export const make = Effect.fn("WorkspaceSearchIndex.make")(function* (
   cwd: string,
   variant: WorkspaceSearchIndexVariant = "paths",
@@ -372,6 +450,7 @@ export const make = Effect.fn("WorkspaceSearchIndex.make")(function* (
         cause,
       }),
   );
+  yield* Effect.forkScoped(rescanWhenWatcherReady(cwd, finder));
 
   const runSearch = Effect.fn("WorkspaceSearchIndex.runSearch")(function* <A>(
     query: string,
