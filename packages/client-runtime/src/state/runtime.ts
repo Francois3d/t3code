@@ -3,11 +3,11 @@ import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
-import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
+import type { ConnectionAttemptError } from "../connection/model.ts";
 import { EnvironmentNotRegisteredError, EnvironmentRegistry } from "../connection/registry.ts";
 import {
   type EnvironmentRpcInput,
@@ -16,6 +16,7 @@ import {
   type EnvironmentStreamCommandRpcTag,
   type EnvironmentSubscriptionRpcTag,
   type EnvironmentUnaryRpcTag,
+  EnvironmentRpcUnavailableError,
   request,
   runStream,
   subscribe,
@@ -492,7 +493,7 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
   readonly environmentId: EnvironmentIdType;
   readonly input: Input;
 }) => Atom.Atom<AsyncResult.AsyncResult<A, E | ER | Error>> {
-  const rpcGenerationAtom = Atom.family((environmentId: EnvironmentIdType) =>
+  const connectionAtom = Atom.family((environmentId: EnvironmentIdType) =>
     runtime.atom(
       followStreamInEnvironment(
         environmentId,
@@ -500,11 +501,7 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
           EnvironmentSupervisor.pipe(
             Effect.map((supervisor) =>
               SubscriptionRef.changes(supervisor.state).pipe(
-                Stream.filterMap((state) =>
-                  state.phase === "connected" ? Result.succeed(state.generation) : Result.failVoid,
-                ),
-                Stream.changes,
-                Stream.map<number, number | null>((generation) => generation),
+                Stream.zipLatest(SubscriptionRef.changes(supervisor.session)),
               ),
             ),
           ),
@@ -525,7 +522,12 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
             followStreamInEnvironment(target.environmentId, invalidate(target.input)),
             { label: `${options.label}:invalidate:${key}`, idleTtlMs },
           );
-    return createInvalidatableQueryAtom(runtime, {
+    return createInvalidatableQueryAtom<
+      EnvironmentRegistry | R,
+      ER,
+      A,
+      E | ConnectionAttemptError | EnvironmentNotRegisteredError | EnvironmentRpcUnavailableError
+    >(runtime, {
       label: `${options.label}:${key}`,
       idleTtlMs,
       staleTimeMs: options.staleTimeMs ?? 30_000,
@@ -534,13 +536,36 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
         : { refreshIntervalMs: options.refreshIntervalMs }),
       ...(revisions === undefined ? {} : { revisions }),
       execute: (get) => {
-        const generation = Option.getOrNull(
-          AsyncResult.value(get(rpcGenerationAtom(target.environmentId))),
+        const connection = Option.getOrNull(
+          AsyncResult.value(get(connectionAtom(target.environmentId))),
         );
-        if (generation === null) {
+        if (connection === null) {
           return Effect.never;
         }
-        return runInEnvironment(target.environmentId, options.execute(target.input));
+        const [connectionState, session] = connection;
+        switch (connectionState.phase) {
+          case "connected":
+            return Option.isSome(session)
+              ? runInEnvironment(target.environmentId, options.execute(target.input))
+              : Effect.never;
+          case "connecting":
+          case "backoff":
+            return Effect.never;
+          case "available":
+          case "offline":
+          case "blocked":
+            if (connectionState.lastFailure !== null) {
+              return Effect.fail(connectionState.lastFailure);
+            }
+            return Effect.fail(
+              new EnvironmentRpcUnavailableError({
+                environmentId: target.environmentId,
+                message: `Environment ${target.environmentId} is ${
+                  connectionState.phase === "available" ? "not connected" : connectionState.phase
+                }.`,
+              }),
+            );
+        }
       },
     });
   });
