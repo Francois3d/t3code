@@ -3,11 +3,13 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 
 import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as RcMap from "effect/RcMap";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -29,6 +31,21 @@ import { normalizeSearchQuery } from "@t3tools/shared/searchRanking";
 
 import * as WorkspacePaths from "./WorkspacePaths.ts";
 import * as WorkspaceSearchIndex from "./WorkspaceSearchIndex.ts";
+
+/**
+ * How often a subscribed workspace re-reads its index entry count. The index
+ * picks up external changes on its own within ~100ms; this is only how long a
+ * client waits to hear that it did. One read costs ~0.5ms, so a second is
+ * already a rounding error against a core.
+ */
+const WORKSPACE_ENTRY_COUNT_POLL_INTERVAL = Duration.seconds(1);
+
+/**
+ * How long a workspace whose index could not be created or read waits before
+ * watching it again. Slow enough that a root which keeps failing costs
+ * nothing, quick enough that a subscriber outlives the outage.
+ */
+const WORKSPACE_ENTRY_COUNT_RETRY_INTERVAL = Duration.seconds(30);
 
 export class WorkspaceEntriesWindowsPathUnsupportedError extends Schema.TaggedErrorClass<WorkspaceEntriesWindowsPathUnsupportedError>()(
   "WorkspaceEntriesWindowsPathUnsupportedError",
@@ -105,8 +122,9 @@ export class WorkspaceEntries extends Context.Service<
     ) => Effect.Effect<ProjectSearchContentsResult, WorkspaceEntriesError>;
     readonly refresh: (cwd: string) => Effect.Effect<void>;
     /**
-     * Emits once per `refresh` of the same workspace root. It is a signal, not
-     * a payload: subscribers re-read through `list`.
+     * Emits once per `refresh` of the same workspace root, and once per change
+     * the index picks up on its own while at least one subscriber is watching.
+     * It is a signal, not a payload: subscribers re-read through `list`.
      *
      * Acquiring the subscription is the effect and consuming it is the stream,
      * so a caller that has awaited this call is already listening and cannot
@@ -180,6 +198,70 @@ export const make = Effect.gen(function* () {
    */
   const entryChanges = yield* PubSub.unbounded<string>();
 
+  /**
+   * The index already tracks external creates and deletes through its own
+   * filesystem watcher, it just has no callback to tell us it moved. Reading
+   * the entry count is the cheapest way to notice, so a subscribed workspace
+   * polls it and publishes the same coarse signal `refresh` does.
+   *
+   * A rename, or a balanced add and delete inside one interval, leaves the
+   * count where it was and publishes nothing; the client's own staleness
+   * window still catches those. Content-only edits deliberately publish
+   * nothing - the tree does not render contents.
+   */
+  const publishWhenEntryCountChanges = Effect.fn("WorkspaceEntries.publishWhenEntryCountChanges")(
+    function* (normalizedCwd: string): Effect.fn.Return<void> {
+      // The count this fibre owns: read and written by nothing else, and
+      // undefined only until the first tick establishes a baseline.
+      let lastCount: number | undefined;
+      const watch = Effect.gen(function* () {
+        const searchIndex = yield* WorkspaceSearchIndex.WorkspaceSearchIndex;
+        yield* Effect.gen(function* () {
+          const count = yield* searchIndex.entryCount();
+          const previousCount = lastCount;
+          lastCount = count;
+          if (previousCount === undefined || previousCount === count) return;
+          yield* PubSub.publish(entryChanges, normalizedCwd);
+        }).pipe(Effect.repeat({ schedule: Schedule.spaced(WORKSPACE_ENTRY_COUNT_POLL_INTERVAL) }));
+      }).pipe(
+        Effect.provide(
+          workspaceSearchIndexes.get(
+            WorkspaceSearchIndex.workspaceSearchIndexKey(normalizedCwd, "paths"),
+          ),
+        ),
+        // An index that cannot be created or read is already surfacing through
+        // `list`, so the watch degrades to the client's staleness window
+        // instead of taking the subscription down with it. The baseline is
+        // dropped with it: the next attempt re-seeds rather than publishing a
+        // change against a count from before the outage.
+        Effect.catch((cause) =>
+          Effect.gen(function* () {
+            lastCount = undefined;
+            yield* Effect.logWarning("Stopped watching the workspace index for external changes", {
+              cwd: normalizedCwd,
+              cause,
+            });
+          }),
+        ),
+      );
+
+      // `watch` only returns when it has failed, so this retries the outage
+      // rather than repeating a healthy poll loop.
+      yield* watch.pipe(
+        Effect.repeat({ schedule: Schedule.spaced(WORKSPACE_ENTRY_COUNT_RETRY_INTERVAL) }),
+      );
+    },
+  );
+
+  /**
+   * One poll fibre per workspace root, shared by every subscriber of that root
+   * and released when the last of them goes away.
+   */
+  const entryCountPollers = yield* RcMap.make({
+    lookup: (normalizedCwd: string) =>
+      Effect.forkScoped(publishWhenEntryCountChanges(normalizedCwd)),
+  });
+
   const refresh: WorkspaceEntries["Service"]["refresh"] = Effect.fn("WorkspaceEntries.refresh")(
     function* (cwd) {
       const normalizedCwd = yield* workspaceRootKey(cwd);
@@ -227,6 +309,7 @@ export const make = Effect.gen(function* () {
     // is being normalised is buffered rather than dropped.
     const subscription = yield* PubSub.subscribe(entryChanges);
     const normalizedCwd = yield* workspaceRootKey(input.cwd);
+    yield* RcMap.get(entryCountPollers, normalizedCwd);
     return Stream.fromSubscription(subscription).pipe(
       Stream.filter((changedCwd) => changedCwd === normalizedCwd),
       Stream.map(() => ({})),

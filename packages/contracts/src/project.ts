@@ -83,7 +83,8 @@ export type ProjectListEntriesResult = typeof ProjectListEntriesResult.Type;
 
 /**
  * Emitted by `subscribeProjectEntryChanges` whenever the server's entry index
- * for a workspace is refreshed. Like `ProjectFileChangedEvent` it carries no
+ * for a workspace changes: either the app refreshed it, or the index picked up
+ * a create or delete made outside the app. Like `ProjectFileChangedEvent` it carries no
  * payload: clients re-read the listing through `projects.listEntries` so
  * limits, ordering and error mapping keep living in one place.
  */

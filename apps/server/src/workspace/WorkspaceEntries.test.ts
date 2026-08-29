@@ -3,12 +3,16 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { FileFinder } from "@ff-labs/fff-node";
 import { it, afterEach, describe, expect } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
+import * as Ref from "effect/Ref";
+import * as TestClock from "effect/testing/TestClock";
 import * as Stream from "effect/Stream";
 import { vi } from "vite-plus/test";
 
@@ -764,3 +768,133 @@ it.layer(TestLayer, { excludeTestServices: true })("WorkspaceEntries", (it) => {
     );
   });
 });
+
+/**
+ * A `FileFinder` whose entry count is whatever `readEntryCount` returns, so a
+ * test can move the count under the index the way an external write would.
+ */
+function mockEntryCountFinder(readEntryCount: () => number) {
+  const mixedSearch = vi.fn(() => {
+    const entryCount = readEntryCount();
+    return {
+      ok: true as const,
+      value: {
+        items: [],
+        scores: [],
+        totalMatched: entryCount,
+        totalFiles: entryCount,
+        totalDirs: 0,
+      },
+    };
+  });
+  const finder = {
+    destroy: vi.fn(),
+    waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
+    getScanProgress: vi.fn(() => ({
+      ok: true as const,
+      value: {
+        scannedFilesCount: readEntryCount(),
+        isScanning: false,
+        isWatcherReady: true,
+        isWarmupComplete: true,
+      },
+    })),
+    mixedSearch,
+  } as unknown as FileFinder;
+  vi.spyOn(FileFinder, "create").mockReturnValueOnce({ ok: true, value: finder });
+  return { mixedSearch };
+}
+
+/**
+ * The same stack as `TestLayer` without excluding the test services: the poll
+ * fibre below is built inside the test's context, so it runs on the TestClock
+ * the test advances instead of on wall-clock ticks.
+ */
+const EntryCountTestLayer = Layer.empty.pipe(
+  Layer.provideMerge(WorkspaceEntries.layer.pipe(Layer.provide(WorkspacePaths.layer))),
+  Layer.provideMerge(WorkspacePaths.layer),
+  Layer.provideMerge(VcsProcess.layer),
+  Layer.provide(
+    ServerConfig.ServerConfig.layerTest(process.cwd(), {
+      prefix: "t3-workspace-entry-count-test-",
+    }),
+  ),
+  Layer.provideMerge(NodeServices.layer),
+);
+
+it.effect(
+  "signals a watcher when the index entry count moves, and stays quiet while it does not",
+  () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir({ prefix: "t3code-workspace-watch-entry-count-" });
+      // The index is mocked so the entry count is the test's to move: the real
+      // one would tie the assertion to filesystem watcher timing.
+      let entryCount = 3;
+      const { mixedSearch } = mockEntryCountFinder(() => entryCount);
+
+      const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
+      const watched = yield* workspaceEntries.watchEntries({ cwd });
+      const signals = yield* Ref.make(0);
+      const firstSignal = yield* Deferred.make<void>();
+      yield* Effect.forkScoped(
+        Stream.runForEach(watched, () =>
+          Ref.update(signals, (count) => count + 1).pipe(
+            Effect.andThen(Deferred.succeed(firstSignal, undefined)),
+          ),
+        ),
+      );
+
+      // The seeding read plus two intervals of an unchanged count. Asserting
+      // the reads happened is what makes the silence below mean something.
+      yield* TestClock.adjust(Duration.seconds(2));
+      expect(mixedSearch).toHaveBeenCalledTimes(3);
+      expect(yield* Ref.get(signals)).toBe(0);
+
+      entryCount = 4;
+      yield* TestClock.adjust(Duration.seconds(1));
+      yield* Deferred.await(firstSignal);
+      expect(yield* Ref.get(signals)).toBe(1);
+    }).pipe(Effect.scoped, Effect.provide(EntryCountTestLayer)),
+);
+
+it.effect("resumes watching after a failed read of the index", () =>
+  Effect.gen(function* () {
+    const cwd = yield* makeTempDir({ prefix: "t3code-workspace-watch-entry-count-retry-" });
+    let entryCount = 3;
+    let failNextRead = true;
+    mockEntryCountFinder(() => {
+      if (failNextRead) {
+        failNextRead = false;
+        throw new Error("native search failed");
+      }
+      return entryCount;
+    });
+
+    const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
+    const watched = yield* workspaceEntries.watchEntries({ cwd });
+    const signals = yield* Ref.make(0);
+    const firstSignal = yield* Deferred.make<void>();
+    yield* Effect.forkScoped(
+      Stream.runForEach(watched, () =>
+        Ref.update(signals, (count) => count + 1).pipe(
+          Effect.andThen(Deferred.succeed(firstSignal, undefined)),
+        ),
+      ),
+    );
+
+    // The seeding read failed, so this workspace is unwatched until the retry.
+    yield* TestClock.adjust(Duration.seconds(1));
+    expect(yield* Ref.get(signals)).toBe(0);
+
+    // Whatever moved during the outage is the retry's new baseline, not a
+    // change to report against a count from before it.
+    entryCount = 4;
+    yield* TestClock.adjust(Duration.seconds(30));
+    expect(yield* Ref.get(signals)).toBe(0);
+
+    entryCount = 5;
+    yield* TestClock.adjust(Duration.seconds(1));
+    yield* Deferred.await(firstSignal);
+    expect(yield* Ref.get(signals)).toBe(1);
+  }).pipe(Effect.scoped, Effect.provide(EntryCountTestLayer)),
+);
