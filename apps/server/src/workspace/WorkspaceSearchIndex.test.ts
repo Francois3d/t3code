@@ -508,3 +508,32 @@ it.live("indexes a file created externally right after construction, without a r
     );
   }),
 );
+
+it.effect("counts index entries without materialising a page", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const mixedSearch = vi.fn(() => ({
+        ok: true as const,
+        value: {
+          items: [],
+          scores: [],
+          totalMatched: 42,
+          totalFiles: 30,
+          totalDirs: 12,
+        },
+      }));
+      const finder = {
+        destroy: vi.fn(),
+        waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
+        getScanProgress: watcherReadyProgress(),
+        mixedSearch,
+      } as unknown as FileFinder;
+      vi.spyOn(FileFinder, "create").mockReturnValueOnce({ ok: true, value: finder });
+
+      const searchIndex = yield* WorkspaceSearchIndex.make("/workspace/project");
+
+      expect(yield* searchIndex.entryCount()).toBe(42);
+      expect(mixedSearch).toHaveBeenCalledWith("", { pageSize: 1 });
+    }),
+  ),
+);

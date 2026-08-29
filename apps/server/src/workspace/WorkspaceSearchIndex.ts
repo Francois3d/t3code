@@ -30,6 +30,7 @@ import { isWorkspaceImagePreviewPath } from "@t3tools/shared/filePreview";
 
 const WORKSPACE_INDEX_MAX_ENTRIES = 25_000;
 const WORKSPACE_INDEX_PAGE_SIZE = WORKSPACE_INDEX_MAX_ENTRIES + 2;
+const WORKSPACE_INDEX_COUNT_PAGE_SIZE = 1;
 const WORKSPACE_INDEX_SCAN_TIMEOUT = "15 seconds";
 const WORKSPACE_INDEX_SCAN_TIMEOUT_MS = 15_000;
 const WORKSPACE_INDEX_IDLE_TTL = "15 minutes";
@@ -113,6 +114,12 @@ export class WorkspaceSearchIndex extends Context.Service<
   WorkspaceSearchIndex,
   {
     readonly list: () => Effect.Effect<ProjectListEntriesResult, WorkspaceSearchIndexSearchFailed>;
+    /**
+     * How many entries the index currently holds. Cheap enough to poll: the
+     * page size of 1 is load-bearing, it returns the total without
+     * materialising the page.
+     */
+    readonly entryCount: () => Effect.Effect<number, WorkspaceSearchIndexSearchFailed>;
     readonly search: (
       query: string,
       limit: number,
@@ -527,6 +534,15 @@ export const make = Effect.fn("WorkspaceSearchIndex.make")(function* (
     },
   );
 
+  const entryCount: WorkspaceSearchIndex["Service"]["entryCount"] = Effect.fn(
+    "WorkspaceSearchIndex.entryCount",
+  )(function* () {
+    const result = yield* runSearch("", WORKSPACE_INDEX_COUNT_PAGE_SIZE, "mixedSearch", () =>
+      finder.mixedSearch("", { pageSize: WORKSPACE_INDEX_COUNT_PAGE_SIZE }),
+    );
+    return result.totalMatched;
+  });
+
   const search: WorkspaceSearchIndex["Service"]["search"] = Effect.fn(
     "WorkspaceSearchIndex.search",
   )(function* (query, limit, kind, imageOnly) {
@@ -600,7 +616,7 @@ export const make = Effect.fn("WorkspaceSearchIndex.make")(function* (
     };
   });
 
-  return WorkspaceSearchIndex.of({ list, refresh, search, searchContents });
+  return WorkspaceSearchIndex.of({ entryCount, list, refresh, search, searchContents });
 });
 
 export const WORKSPACE_SEARCH_INDEX_VARIANTS = ["paths", "content"] as const;
