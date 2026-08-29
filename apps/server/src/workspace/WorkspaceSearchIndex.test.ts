@@ -537,3 +537,46 @@ it.effect("counts index entries without materialising a page", () =>
     }),
   ),
 );
+
+// The native index refuses these roots itself, but on an exact string match
+// only, so a trailing separator walks past it. These cover the resolved-path
+// guard that closes that gap, and the ordinary root that must keep working.
+it.effect.each([
+  { label: "the filesystem root", cwd: NodePath.parse(process.cwd()).root },
+  { label: "the home directory", cwd: NodeOS.homedir() },
+  { label: "a trailing-slash home directory", cwd: `${NodeOS.homedir()}${NodePath.sep}` },
+])("refuses to index $label before constructing a finder", ({ cwd }) =>
+  Effect.gen(function* () {
+    const create = vi.spyOn(FileFinder, "create");
+
+    const error = yield* Effect.flip(Effect.scoped(WorkspaceSearchIndex.make(cwd)));
+
+    expect(error).toMatchObject({
+      _tag: "WorkspaceSearchIndexCreateFailed",
+      cwd,
+    });
+    expect(error.message).toContain(cwd);
+    expect(create).not.toHaveBeenCalled();
+  }),
+);
+
+it.effect("indexes an ordinary project root without opting into root or home scanning", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const finder = {
+        destroy: vi.fn(),
+        waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
+        getScanProgress: watcherReadyProgress(),
+      } as unknown as FileFinder;
+      const create = vi
+        .spyOn(FileFinder, "create")
+        .mockReturnValueOnce({ ok: true, value: finder });
+
+      yield* WorkspaceSearchIndex.make(NodePath.join(NodeOS.homedir(), "workspace", "project"));
+
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(create.mock.calls[0]?.[0]).not.toHaveProperty("enableFsRootScanning");
+      expect(create.mock.calls[0]?.[0]).not.toHaveProperty("enableHomeDirScanning");
+    }),
+  ),
+);

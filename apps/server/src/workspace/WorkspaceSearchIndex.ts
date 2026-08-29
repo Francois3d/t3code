@@ -9,6 +9,13 @@ import {
   type Result,
   type SearchResult,
 } from "@ff-labs/fff-node";
+import * as NodeOS from "node:os";
+// Pure string work on a workspace root, deliberately kept out of the Effect
+// context: taking `Path` as a service would grow a requirement that every
+// caller and every test of this index would then have to provide.
+// @effect-diagnostics-next-line nodeBuiltinImport:off
+import * as NodePath from "node:path";
+
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -309,10 +316,35 @@ function withDirectoryAncestors(entries: ReadonlyArray<ProjectEntry>): ProjectEn
   return [...entryByPath.values()];
 }
 
+/**
+ * Why we refuse these roots ourselves rather than leaning on the native index:
+ * it rejects them on an exact string match, so a trailing separator walks
+ * straight past its check and buys the caller the unbounded watcher churn the
+ * rejection exists to prevent. Resolving first lands `~`, an absolute home
+ * path, and any trailing-slash variant of either in the same branch, and gives
+ * a reason naming the path instead of a generic native diagnostic.
+ */
+function unsupportedIndexRootReason(cwd: string): string | undefined {
+  const resolved = NodePath.resolve(cwd);
+  if (resolved === NodePath.parse(resolved).root) {
+    return `Indexing the filesystem root '${resolved}' is not supported. Open a project directory instead.`;
+  }
+  const homeDirectory = NodeOS.homedir();
+  if (homeDirectory && resolved === NodePath.resolve(homeDirectory)) {
+    return `Indexing the home directory '${resolved}' is not supported. Open a project directory inside it instead.`;
+  }
+  return undefined;
+}
+
 const createFinder = Effect.fn("WorkspaceSearchIndex.createFinder")(function* (
   cwd: string,
   variant: WorkspaceSearchIndexVariant,
 ) {
+  const unsupportedRootReason = unsupportedIndexRootReason(cwd);
+  if (unsupportedRootReason !== undefined) {
+    return yield* new WorkspaceSearchIndexCreateFailed({ cwd, reason: unsupportedRootReason });
+  }
+
   const result = yield* Effect.try({
     try: () =>
       FileFinder.create({
@@ -323,8 +355,6 @@ const createFinder = Effect.fn("WorkspaceSearchIndex.createFinder")(function* (
         // composer path search, file picker) keep the lightweight index.
         disableContentIndexing: variant !== "content",
         aiMode: false,
-        enableFsRootScanning: true,
-        enableHomeDirScanning: true,
       }),
     catch: (cause) =>
       new WorkspaceSearchIndexCreateFailed({
