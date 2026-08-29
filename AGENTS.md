@@ -132,6 +132,8 @@ Clients send typed WebSocket requests. The server turns them into _commands_, a 
 
 Full glossary with file links: `docs/internals/glossary.md`
 
+How code here is written - service shape, error modelling, imports, styling, state, testing - is indexed in `docs/internals/code-conventions.md`. It points at the two CI review agents in `.macroscope/check-run-agents/`, whose prompts are the enforced style guides for Effect services and web UI. Read the relevant one before changing either area.
+
 ## Where code lives
 
 - `apps/server` - WebSocket, orchestration, providers, checkpointing. Effect-heavy: read `.repos/effect-smol/LLMS.md` before writing Effect code.
