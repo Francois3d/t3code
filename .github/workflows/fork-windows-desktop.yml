@@ -1,0 +1,221 @@
+# Fork-only: build an unsigned Windows desktop installer from this fork.
+#
+# The upstream `release.yml` cannot do this job here. It runs on Blacksmith
+# runners this fork has no access to, resolves the T3 Connect public config from
+# Cloudflare and Clerk secrets it does not hold, and signs through Azure Trusted
+# Signing. This workflow keeps the parts that decide whether the app works and
+# drops the parts that only decide whether it is signed and published.
+#
+# Two deliberate differences from upstream:
+#   - The Clerk and relay identifiers come from `.env.example` instead of the
+#     `relay_public_config` job. That file documents them as the same public
+#     values baked into official builds, so the resulting app talks to the same
+#     production relay and its sign-in UI is present rather than silently absent.
+#   - Nothing is signed. Windows SmartScreen will warn on first run; see the
+#     job summary for how to get past it.
+#
+# x64 only, matching the sole Windows entry upstream has enabled. Upstream keeps
+# a `windows-11-arm` matrix entry commented out; if you ever need arm64, revive
+# that upstream entry rather than guessing a cross-build here.
+#
+# Manual only. A Windows build takes ~25 minutes and is wanted per release of
+# your own work, not per push.
+name: Fork Windows desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA to build"
+        required: false
+        default: local
+        type: string
+
+concurrency:
+  group: fork-windows-desktop-${{ inputs.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Windows packages a Linux node-pty binary so terminals work inside WSL. The
+  # Windows runner cannot produce it, so it is built here and handed over as an
+  # artifact, exactly as upstream does.
+  wsl_node_pty:
+    name: Build WSL node-pty (linux-x64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: |
+            args:
+              - --filter=t3...
+
+      - name: Build node-pty linux-x64 prebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          # node-pty resolves from apps/server, where it is a dependency, and
+          # node-addon-api resolves from node-pty's own tree, so node-gyp needs
+          # nothing else.
+          pty_pkg="$(node -e "console.log(require.resolve('node-pty/package.json', { paths: ['$GITHUB_WORKSPACE/apps/server'] }))")"
+          pty_dir="$(dirname "$pty_pkg")"
+          ( cd "$pty_dir" && npx --yes node-gyp rebuild )
+          mkdir -p wsl-prebuild
+          cp "$pty_dir/build/Release/pty.node" wsl-prebuild/pty.node
+          file wsl-prebuild/pty.node
+
+      - name: Upload node-pty linux-x64 prebuild
+        uses: actions/upload-artifact@v7
+        with:
+          name: wsl-node-pty-x64
+          path: wsl-prebuild/pty.node
+          if-no-files-found: error
+
+  build:
+    name: Build Windows x64
+    needs: [wsl_node_pty]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          # Upstream disables the package cache on Windows and caches the store
+          # by path instead; the next two steps do the same.
+          cache: false
+          run-install: false
+
+      - name: Resolve package cache path
+        id: package_cache_path
+        shell: pwsh
+        run: '"path=$(vp pm cache dir)" >> $env:GITHUB_OUTPUT'
+
+      - name: Cache packages
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.package_cache_path.outputs.path }}
+          key: fork-windows-packages-v1-x64-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install desktop dependencies
+        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Enable T3 Connect public config
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The build reads these through Vite's env loading. Without them the
+          # sign-in UI is absent and the omission looks like a missing feature
+          # rather than a config gap.
+          cp .env.example .env
+          echo "Baked T3 Connect public config from .env.example:"
+          grep -E '^T3CODE_(CLERK_PUBLISHABLE_KEY|RELAY_URL)=' .env
+
+      - name: Cache resource monitor
+        id: resource_monitor_cache
+        uses: actions/cache@v6
+        with:
+          path: native/resource-monitor/target/x86_64-pc-windows-msvc/release/t3-resource-monitor.exe
+          key: fork-resource-monitor-x64-${{ hashFiles('native/resource-monitor/Cargo.lock', 'native/resource-monitor/Cargo.toml', 'native/resource-monitor/src/**') }}
+
+      - name: Setup Rust
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Download WSL node-pty prebuild
+        uses: actions/download-artifact@v7
+        with:
+          name: wsl-node-pty-x64
+          path: wsl-prebuild
+
+      - name: Install Spectre-mitigated MSVC libs
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -products * -latest -property installationPath
+          $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $proc = Start-Process -FilePath $setupExe `
+            -ArgumentList "modify", "--installPath", "`"$installPath`"", "--add", `
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64.Spectre", "--quiet", "--norestart" `
+            -Wait -PassThru -NoNewWindow
+          if ($null -eq $proc -or $proc.ExitCode -ne 0) {
+            $code = if ($null -ne $proc) { $proc.ExitCode } else { 1 }
+            Write-Error "Visual Studio Installer failed with exit code $code"
+            exit $code
+          }
+
+      - name: Build desktop artifact
+        shell: bash
+        env:
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: ${{ steps.resource_monitor_cache.outputs.cache-hit == 'true' }}
+        run: |
+          set -euo pipefail
+          # `--wsl-prebuild` stages the Linux pty.node built above so the packaged
+          # WSL backend ships a ready binary instead of compiling on first launch.
+          # Upstream marks it required for a working WSL backend on Windows.
+          #
+          # `--signed` is deliberately absent, and no signing variables are set:
+          # electron-builder treats a set-but-empty CSC_LINK as a signing request,
+          # so they are left unset entirely rather than passed through as blanks.
+          vp run dist:desktop:artifact \
+            --platform win \
+            --target nsis \
+            --arch x64 \
+            --wsl-prebuild "$GITHUB_WORKSPACE/wsl-prebuild/pty.node" \
+            --verbose
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: t3-code-windows-x64
+          path: |
+            release/*.exe
+            release/*.exe.blockmap
+          if-no-files-found: error
+
+      - name: Summarise
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo "### T3 Code — Windows x64"
+            echo
+            echo "Built from \`${{ inputs.ref }}\` at \`${{ github.sha }}\`."
+            echo
+            for f in release/*.exe; do
+              echo "- \`$(basename "$f")\` ($(du -h "$f" | cut -f1))"
+            done
+            echo
+            echo "**This installer is unsigned.** SmartScreen will show"
+            echo "\"Windows protected your PC\" on first run — choose **More info**,"
+            echo "then **Run anyway**."
+            echo
+            echo "State lives in \`%USERPROFILE%\\.t3\`, outside the install, so it"
+            echo "survives replacing an existing T3 Code."
+          } >> "$GITHUB_STEP_SUMMARY"
