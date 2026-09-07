@@ -13,12 +13,10 @@ import {
   type EnvironmentRpcInput,
   type EnvironmentRpcStreamFailure,
   type EnvironmentRpcStreamValue,
-  type EnvironmentStreamCommandRpcTag,
   type EnvironmentSubscriptionRpcTag,
   type EnvironmentUnaryRpcTag,
   EnvironmentRpcUnavailableError,
   request,
-  runStream,
   subscribe,
 } from "../rpc/client.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
@@ -61,6 +59,10 @@ interface EnvironmentQueryAtomOptions<Input, A, E, R> extends EnvironmentAtomOpt
    * underlying data moved.
    */
   readonly invalidate?: (input: Input) => Stream.Stream<unknown, unknown, R>;
+  readonly refreshTrigger?: (target: {
+    readonly environmentId: EnvironmentIdType;
+    readonly input: Input;
+  }) => Atom.Atom<unknown> | undefined;
 }
 
 interface EnvironmentSubscriptionAtomOptions<Input, A, E, R> {
@@ -342,6 +344,8 @@ export interface AtomQueryOptions extends AtomCommandOptions {
    * verification flows where a cached failure must not satisfy a retry.
    */
   readonly refresh?: boolean;
+  /** Interrupt the query wait when its caller no longer wants the result. */
+  readonly signal?: AbortSignal;
 }
 
 export async function executeAtomQuery<A, E>(
@@ -368,7 +372,11 @@ export async function executeAtomQuery<A, E>(
       });
     }),
   );
-  return executeAtomCommand(() => Effect.runPromiseExit(query), options, reporter);
+  return executeAtomCommand(
+    () => Effect.runPromiseExit(query, { signal: options.signal }),
+    options,
+    reporter,
+  );
 }
 
 export function createRuntimeCommand<R, ER, W, A, E>(
@@ -380,31 +388,6 @@ export function createRuntimeCommand<R, ER, W, A, E>(
     readonly concurrency?: AtomCommandConcurrency<W>;
   },
 ): AtomCommand<W, A, E | ER> {
-  const scheduler = options.scheduler ?? createAtomCommandScheduler();
-  const concurrency = options.concurrency ?? { mode: "parallel" as const };
-  return {
-    label: options.label,
-    run: (registry, input) =>
-      settleAtomCommandResult(() =>
-        scheduler.schedule(registry, concurrency, input, () => {
-          const atom = runtime
-            .atom(options.execute(input, registry))
-            .pipe(Atom.withLabel(options.label));
-          return executeAtomQuery(registry, atom, { reportDefect: false, reportFailure: false });
-        }),
-      ),
-  };
-}
-
-export function createRuntimeStreamCommand<R, ER, W, A, E>(
-  runtime: Atom.AtomRuntime<R, ER>,
-  options: {
-    readonly label: string;
-    readonly execute: (input: W, registry: AtomRegistry.AtomRegistry) => Stream.Stream<A, E, R>;
-    readonly scheduler?: AtomCommandScheduler;
-    readonly concurrency?: AtomCommandConcurrency<W>;
-  },
-): AtomCommand<W, A, E | ER | Cause.NoSuchElementError> {
   const scheduler = options.scheduler ?? createAtomCommandScheduler();
   const concurrency = options.concurrency ?? { mode: "parallel" as const };
   return {
@@ -468,7 +451,7 @@ function parseEnvironmentRpcKey<Input>(key: string): {
   };
 }
 
-export function runInEnvironment<A, E, R>(
+function runInEnvironment<A, E, R>(
   environmentId: EnvironmentIdType,
   effect: Effect.Effect<A, E, R>,
 ): Effect.Effect<
@@ -533,28 +516,11 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
   const family = Atom.family((key: string) => {
     const target = parseEnvironmentRpcKey<Input>(key);
     const idleTtlMs = options.idleTtlMs ?? 5 * 60_000;
-    const revisions =
-      invalidate === undefined
-        ? undefined
-        : createStreamRevisionAtom(
-            runtime,
-            followStreamInEnvironment(target.environmentId, invalidate(target.input)),
-            { label: `${options.label}:invalidate:${key}`, idleTtlMs },
-          );
-    return createInvalidatableQueryAtom<
-      EnvironmentRegistry | R,
-      ER,
-      A,
-      E | ConnectionAttemptError | EnvironmentNotRegisteredError | EnvironmentRpcUnavailableError
-    >(runtime, {
-      label: `${options.label}:${key}`,
-      idleTtlMs,
-      staleTimeMs: options.staleTimeMs ?? 30_000,
-      ...(options.refreshIntervalMs === undefined
-        ? {}
-        : { refreshIntervalMs: options.refreshIntervalMs }),
-      ...(revisions === undefined ? {} : { revisions }),
-      execute: (get) => {
+    const queryAtom = runtime
+      .atom<
+        A,
+        E | ConnectionAttemptError | EnvironmentNotRegisteredError | EnvironmentRpcUnavailableError
+      >((get) => {
         const connection = Option.getOrNull(
           AsyncResult.value(get(connectionAtom(target.environmentId))),
         );
@@ -585,8 +551,34 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
               }),
             );
         }
-      },
-    });
+      })
+      .pipe(
+        Atom.swr({
+          staleTime: options.staleTimeMs ?? 30_000,
+          revalidateOnMount: true,
+        }),
+        Atom.setIdleTTL(idleTtlMs),
+      );
+    const intervalQuery =
+      options.refreshIntervalMs === undefined
+        ? queryAtom
+        : queryAtom.pipe(Atom.withRefresh(options.refreshIntervalMs));
+    // A server-pushed `invalidate` stream is one more refresh signal: it becomes a
+    // revision atom so it drives the same trigger path a caller-supplied atom does.
+    const refreshTrigger =
+      options.refreshTrigger?.(target) ??
+      (invalidate === undefined
+        ? undefined
+        : createStreamRevisionAtom(
+            runtime,
+            followStreamInEnvironment(target.environmentId, invalidate(target.input)),
+            { label: `${options.label}:invalidate:${key}`, idleTtlMs },
+          ));
+    return (
+      refreshTrigger === undefined
+        ? intervalQuery
+        : intervalQuery.pipe(Atom.makeRefreshOnSignal(refreshTrigger))
+    ).pipe(Atom.setIdleTTL(idleTtlMs), Atom.withLabel(`${options.label}:${key}`));
   });
   return (target) => family(environmentRpcKey(target));
 }
@@ -694,29 +686,6 @@ export function createEnvironmentCommand<R, ER, Input, A, E>(
   });
 }
 
-function createEnvironmentStreamCommand<R, ER, Input, A, E>(
-  runtime: Atom.AtomRuntime<EnvironmentRegistry | R, ER>,
-  options: {
-    readonly label: string;
-    readonly execute: (input: Input) => Stream.Stream<A, E, EnvironmentSupervisor | R>;
-    readonly scheduler?: AtomCommandScheduler;
-    readonly concurrency?: AtomCommandConcurrency<{
-      readonly environmentId: EnvironmentIdType;
-      readonly input: Input;
-    }>;
-  },
-) {
-  return createRuntimeStreamCommand(runtime, {
-    label: options.label,
-    ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
-    ...(options.concurrency === undefined ? {} : { concurrency: options.concurrency }),
-    execute: (target) =>
-      runStreamInEnvironment(target.environmentId, options.execute(target.input)).pipe(
-        Stream.withSpan(options.label),
-      ),
-  });
-}
-
 export function createEnvironmentRpcQueryAtomFamily<R, ER, TTag extends EnvironmentUnaryRpcTag>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, ER>,
   options: {
@@ -733,6 +702,10 @@ export function createEnvironmentRpcQueryAtomFamily<R, ER, TTag extends Environm
     readonly invalidate?: (
       input: EnvironmentRpcInput<TTag>,
     ) => Stream.Stream<unknown, unknown, EnvironmentSupervisor | R>;
+    readonly refreshTrigger?: (target: {
+      readonly environmentId: EnvironmentIdType;
+      readonly input: EnvironmentRpcInput<TTag>;
+    }) => Atom.Atom<unknown> | undefined;
   },
 ) {
   const invalidate = options.invalidate;
@@ -751,6 +724,7 @@ export function createEnvironmentRpcQueryAtomFamily<R, ER, TTag extends Environm
           invalidate: (input: EnvironmentRpcInput<TTag>) =>
             invalidate(input).pipe(Stream.catchCause(() => Stream.empty)),
         }),
+    ...(options.refreshTrigger === undefined ? {} : { refreshTrigger: options.refreshTrigger }),
     execute: (input: EnvironmentRpcInput<TTag>) => request(options.tag, input),
   });
 }
@@ -827,29 +801,5 @@ export function createEnvironmentRpcCommand<R, ER, TTag extends EnvironmentUnary
         Effect.ensuring(options.onSettled?.(target, registry) ?? Effect.void),
       );
     },
-  });
-}
-
-export function createEnvironmentRpcStreamCommand<
-  R,
-  ER,
-  TTag extends EnvironmentStreamCommandRpcTag,
->(
-  runtime: Atom.AtomRuntime<EnvironmentRegistry | R, ER>,
-  options: {
-    readonly label: string;
-    readonly tag: TTag;
-    readonly scheduler?: AtomCommandScheduler;
-    readonly concurrency?: AtomCommandConcurrency<{
-      readonly environmentId: EnvironmentIdType;
-      readonly input: EnvironmentRpcInput<TTag>;
-    }>;
-  },
-) {
-  return createEnvironmentStreamCommand(runtime, {
-    label: options.label,
-    ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
-    ...(options.concurrency === undefined ? {} : { concurrency: options.concurrency }),
-    execute: (input: EnvironmentRpcInput<TTag>) => runStream(options.tag, input),
   });
 }

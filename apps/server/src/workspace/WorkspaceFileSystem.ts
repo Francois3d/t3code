@@ -3,10 +3,13 @@
  * WorkspaceFileSystem - Effect service contract for workspace file mutations.
  *
  * Owns workspace-root-relative file read/write operations and their associated
- * safety checks and cache invalidation hooks.
+ * safety checks and cache invalidation hooks. Reads also accept absolute host
+ * paths so clients can show files an agent left outside the workspace; writes
+ * never leave the root.
  *
  * @module WorkspaceFileSystem
  */
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 
 import type {
@@ -108,7 +111,10 @@ export type WorkspaceFileSystemError = typeof WorkspaceFileSystemError.Type;
 export class WorkspaceFileSystem extends Context.Service<
   WorkspaceFileSystem,
   {
-    /** Read a UTF-8 text file relative to the workspace root. */
+    /**
+     * Read a UTF-8 text file relative to the workspace root, or any host file by
+     * absolute path.
+     */
     readonly readFile: (
       input: ProjectReadFileInput,
     ) => Effect.Effect<
@@ -153,8 +159,8 @@ export const make = Effect.gen(function* () {
    * Resolve one absolute path with `realpath` and prove it sits inside the
    * workspace root. Lexical containment is not enough: a symlink inside the
    * workspace can point anywhere, so both ends are resolved physically and
-   * compared. Callers pick what they need contained — `readFile` contains the
-   * file it opens, `watchFile` the directory it watches.
+   * compared. `watchFile` contains every directory it watches this way; reads
+   * deliberately do not, since they may target a host file outside the root.
    */
   const realPathWithinRoot = Effect.fn("WorkspaceFileSystem.realPathWithinRoot")(function* (
     input: ProjectReadFileInput,
@@ -201,18 +207,91 @@ export const make = Effect.gen(function* () {
     return realPath;
   });
 
-  const readFile: WorkspaceFileSystem["Service"]["readFile"] = Effect.fn(
-    "WorkspaceFileSystem.readFile",
-  )(function* (input) {
+  /**
+   * Resolves the file a read targets. Workspace-relative paths must stay inside the
+   * root, symlinks included. An absolute path reads a host file in place, such as a
+   * report an agent wrote to a temp directory; it gets no root check.
+   */
+  const resolveReadTarget = Effect.fn("WorkspaceFileSystem.resolveReadTarget")(function* (
+    input: ProjectReadFileInput,
+  ) {
+    const requestedPath = input.relativePath.trim();
+    if (path.isAbsolute(requestedPath)) {
+      const realTargetPath = yield* Effect.tryPromise({
+        try: () => NodeFSP.realpath(requestedPath),
+        catch: (cause) =>
+          new WorkspaceFileSystemOperationError({
+            workspaceRoot: input.cwd,
+            relativePath: input.relativePath,
+            resolvedPath: requestedPath,
+            operationPath: requestedPath,
+            operation: "realpath-target",
+            cause,
+          }),
+      });
+      return { relativePath: requestedPath, realTargetPath };
+    }
+
     const target = yield* workspacePaths.resolveRelativePathWithinRoot({
       workspaceRoot: input.cwd,
       relativePath: input.relativePath,
     });
-    const realTargetPath = yield* realPathWithinRoot(input, target.absolutePath);
+
+    const realWorkspaceRoot = yield* Effect.tryPromise({
+      try: () => NodeFSP.realpath(input.cwd),
+      catch: (cause) =>
+        new WorkspaceFileSystemOperationError({
+          workspaceRoot: input.cwd,
+          relativePath: input.relativePath,
+          resolvedPath: target.absolutePath,
+          operationPath: input.cwd,
+          operation: "realpath-workspace-root",
+          cause,
+        }),
+    });
+    const realTargetPath = yield* Effect.tryPromise({
+      try: () => NodeFSP.realpath(target.absolutePath),
+      catch: (cause) =>
+        new WorkspaceFileSystemOperationError({
+          workspaceRoot: input.cwd,
+          relativePath: input.relativePath,
+          resolvedPath: target.absolutePath,
+          operationPath: target.absolutePath,
+          operation: "realpath-target",
+          cause,
+        }),
+    });
+    const relativeRealPath = path.relative(realWorkspaceRoot, realTargetPath);
+    if (
+      relativeRealPath.startsWith(`..${path.sep}`) ||
+      relativeRealPath === ".." ||
+      path.isAbsolute(relativeRealPath)
+    ) {
+      return yield* new WorkspaceFilePathEscapeError({
+        workspaceRoot: input.cwd,
+        relativePath: input.relativePath,
+        resolvedWorkspaceRoot: realWorkspaceRoot,
+        resolvedPath: realTargetPath,
+      });
+    }
+    return { relativePath: target.relativePath, realTargetPath };
+  });
+
+  const readFile: WorkspaceFileSystem["Service"]["readFile"] = Effect.fn(
+    "WorkspaceFileSystem.readFile",
+  )(function* (input) {
+    const target = yield* resolveReadTarget(input);
+    const realTargetPath = target.realTargetPath;
 
     return yield* Effect.acquireUseRelease(
       Effect.tryPromise({
-        try: () => NodeFSP.open(realTargetPath, "r"),
+        // Non-blocking so a FIFO cannot hang the open; the stat below rejects
+        // it. Regular files ignore the flag. Windows lacks it.
+        try: () =>
+          NodeFSP.open(
+            realTargetPath,
+            NodeFS.constants.O_RDONLY | (NodeFS.constants.O_NONBLOCK ?? 0),
+          ),
         catch: (cause) =>
           new WorkspaceFileSystemOperationError({
             workspaceRoot: input.cwd,

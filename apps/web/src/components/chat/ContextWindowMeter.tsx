@@ -9,6 +9,7 @@ import {
   resolveContextWindowUsageLevel,
 } from "./ContextWindowMeter.logic";
 import { Minimize2Icon } from "lucide-react";
+import { composerFloatingLayerProps } from "./composerEventScope";
 
 const USAGE_LEVEL_COLORS = {
   normal: "color-mix(in oklab, var(--color-muted-foreground) 72%, transparent)",
@@ -69,6 +70,7 @@ export function ContextWindowMeter(props: {
         }
       />
       <PopoverPopup
+        {...composerFloatingLayerProps}
         tooltipStyle
         side="top"
         align="end"
