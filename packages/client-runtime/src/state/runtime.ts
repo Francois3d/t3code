@@ -11,6 +11,8 @@ import type { ConnectionAttemptError } from "../connection/model.ts";
 import { EnvironmentNotRegisteredError, EnvironmentRegistry } from "../connection/registry.ts";
 import {
   type EnvironmentRpcInput,
+  type EnvironmentRpcSuccess,
+  type EnvironmentRpcFailure,
   type EnvironmentRpcStreamFailure,
   type EnvironmentRpcStreamValue,
   type EnvironmentSubscriptionRpcTag,
@@ -490,7 +492,12 @@ export function followStreamInEnvironment<A, E, R>(
 
 export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, ER>,
-  options: EnvironmentQueryAtomOptions<Input, A, E, EnvironmentSupervisor | R>,
+  options: EnvironmentQueryAtomOptions<
+    Input,
+    A,
+    E,
+    EnvironmentSupervisor | EnvironmentRegistry | AtomRegistry.AtomRegistry | R
+  >,
 ): (target: {
   readonly environmentId: EnvironmentIdType;
   readonly input: Input;
@@ -672,7 +679,12 @@ export function createEnvironmentSubscriptionAtomFamily<R, ER, Input, A, E>(
 
 export function createEnvironmentCommand<R, ER, Input, A, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, ER>,
-  options: EnvironmentCommandAtomOptions<Input, A, E, EnvironmentSupervisor | R>,
+  options: EnvironmentCommandAtomOptions<
+    Input,
+    A,
+    E,
+    EnvironmentSupervisor | EnvironmentRegistry | R
+  >,
 ) {
   return createRuntimeCommand(runtime, {
     label: options.label,
@@ -691,6 +703,13 @@ export function createEnvironmentRpcQueryAtomFamily<R, ER, TTag extends Environm
   options: {
     readonly label: string;
     readonly tag: TTag;
+    readonly execute?: (
+      input: EnvironmentRpcInput<TTag>,
+    ) => Effect.Effect<
+      EnvironmentRpcSuccess<TTag>,
+      EnvironmentRpcFailure<TTag> | EnvironmentRpcUnavailableError,
+      EnvironmentSupervisor | EnvironmentRegistry
+    >;
     readonly staleTimeMs?: number;
     readonly idleTtlMs?: number;
     readonly refreshIntervalMs?: number;
@@ -725,7 +744,8 @@ export function createEnvironmentRpcQueryAtomFamily<R, ER, TTag extends Environm
             invalidate(input).pipe(Stream.catchCause(() => Stream.empty)),
         }),
     ...(options.refreshTrigger === undefined ? {} : { refreshTrigger: options.refreshTrigger }),
-    execute: (input: EnvironmentRpcInput<TTag>) => request(options.tag, input),
+    execute: (input: EnvironmentRpcInput<TTag>) =>
+      options.execute?.(input) ?? request(options.tag, input),
   });
 }
 
@@ -766,6 +786,13 @@ export function createEnvironmentRpcCommand<R, ER, TTag extends EnvironmentUnary
   options: {
     readonly label: string;
     readonly tag: TTag;
+    readonly execute?: (
+      input: EnvironmentRpcInput<TTag>,
+    ) => Effect.Effect<
+      EnvironmentRpcSuccess<TTag>,
+      EnvironmentRpcFailure<TTag> | EnvironmentRpcUnavailableError,
+      EnvironmentSupervisor | EnvironmentRegistry
+    >;
     readonly scheduler?: AtomCommandScheduler;
     readonly concurrency?: AtomCommandConcurrency<{
       readonly environmentId: EnvironmentIdType;
@@ -796,7 +823,7 @@ export function createEnvironmentRpcCommand<R, ER, TTag extends EnvironmentUnary
         environmentId,
         input,
       };
-      return request(options.tag, input).pipe(
+      return (options.execute?.(input) ?? request(options.tag, input)).pipe(
         Effect.tap(() => options.onSuccess?.(target, registry) ?? Effect.void),
         Effect.ensuring(options.onSettled?.(target, registry) ?? Effect.void),
       );
