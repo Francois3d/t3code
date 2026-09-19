@@ -416,7 +416,7 @@ const waitForIndexReady = Effect.fn("WorkspaceSearchIndex.waitForIndexReady")(fu
  */
 const rescanWhenWatcherReady = Effect.fn("WorkspaceSearchIndex.rescanWhenWatcherReady")(function* (
   cwd: string,
-  finder: FileFinder,
+  finder: FileFinderType,
 ): Effect.fn.Return<void> {
   const warn = (message: string) =>
     Effect.logWarning(message).pipe(

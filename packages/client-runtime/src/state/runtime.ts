@@ -599,7 +599,7 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
  */
 export function createStreamRevisionAtom<R, ER, A, E>(
   runtime: Atom.AtomRuntime<R, ER>,
-  stream: Stream.Stream<A, E, R>,
+  stream: Stream.Stream<A, E, AtomRegistry.AtomRegistry | R>,
   options: { readonly label: string; readonly idleTtlMs: number },
 ): Atom.Atom<number> {
   return runtime
