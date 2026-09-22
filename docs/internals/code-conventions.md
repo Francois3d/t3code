@@ -15,7 +15,8 @@ Authoritative sources, in precedence order:
    web UI. Read the relevant one before a PR that touches either area.
 3. `oxlint-plugin-t3code/rules/` — conventions that are machine-checked.
 4. [.macroscope/approvability.md](../../.macroscope/approvability.md) — a PR that changes a
-   product default is never auto-approvable and needs human review.
+   product default, or that adds or broadens a directive suppressing a lint, type-checker, or
+   LSP diagnostic, is never auto-approvable and needs human review.
 5. This page and the rest of `docs/internals/`.
 
 ## Toolchain
@@ -30,6 +31,10 @@ Authoritative sources, in precedence order:
   commit — that is on you and on CI.
 - Do not run repo-wide `vp check`, `vp run -r test`, or `vp run -r typecheck`. Run the
   focused tests and the typecheck for the package you touched. CI owns the full suite.
+- Dependency patches live in `patches/`. pnpm installs each patch hash at a new filesystem
+  path, so after adding or changing one, restart Metro once with `vp run dev:client:reset`
+  from `apps/mobile` and refresh CocoaPods before rebuilding an existing iOS project. A
+  cached transform or an old Pods project otherwise keeps compiling the previous copy.
 
 ## TypeScript baseline
 
@@ -65,6 +70,11 @@ Defined in `oxlint-plugin-t3code/rules/`, configured from the root `vite.config.
 
 `eslint/no-restricted-imports` also bans the `@t3tools/client-runtime` package root and
 `CodeView` from `@pierre/diffs/react`.
+
+A directive that disables or suppresses any static-analysis diagnostic — lint, type-checker,
+or LSP, at file, line, or configuration level — carries an adjacent comment saying why that
+diagnostic has to be off there. The directive is not its own explanation: the Effect service
+review agent reports a missing reason as a violation, and the PR loses auto-approval.
 
 ## Imports and package boundaries
 
@@ -219,14 +229,27 @@ uniwind (Tailwind for RN) with compiled semantic themes; use `className` and `cn
 `StyleSheet` or hex. Theme access is lint-enforced: no `useThemeColor`, no
 `useCSSVariable`, no `dark:`/`light:` utilities, and `useUniwindTheme` only from the
 allowlisted native-interop boundaries — a semantic token is the answer in ordinary UI.
-Header behavior on iOS is subtle and documented in
-[mobile-navigation.md](./mobile-navigation.md). Platform differences go in
+Native iOS behavior is subtle and documented in
+[mobile-navigation.md](./mobile-navigation.md): headers and the brand title slot,
+`ControlPillMenu` for semantic menu icon colors, and the `PresentationSource` registry that
+anchors AVKit, Quick Look, and the share sheet. Let the native presenter own its transition
+rather than layering `preferredTransition` or a custom animator over it. Fast Refresh and the
+hot-update boundaries around the connection runtime, atom registry, and uniwind patch are in
+[mobile-development.md](./mobile-development.md). Platform differences go in
 platform-extension files first, then `Platform.OS`.
 
 `packages/client-runtime` owns every non-visual client concern — connection lifecycle,
 authorization, RPC session, environment registry, Atom domain state. Apps supply the
 `platform` layer and the UI. App code must not construct transports, retry loops, or RPC
 clients. RN-only APIs must never enter `client-runtime`.
+
+[voice-input.md](./voice-input.md) is the worked example of that boundary. The shared
+`VoiceInputController` owns preparation, recording, transcription, cancellation, and insertion
+into the captured draft selection while importing neither React Native nor an Apple API; capture
+and native recognition stay in the app. It also fixes the rules for adding transcription
+services: credentials belong to the environment and never reach a client, a service ID is
+meaningful only within its environment, and remote support is opt-in behind an
+`ExecutionEnvironmentCapabilities` check so older servers simply expose no choices.
 
 Mobile is multi-environment by construction: it pairs explicitly (typed URL or QR) and has
 no implicit local environment, so every feature needs an unpair/offline story. Changes
